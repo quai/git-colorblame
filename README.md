@@ -7,24 +7,40 @@ A git tool that displays `git blame` output with age-based heatmap coloring. Old
 ## Features
 
 - Plasma-inspired color gradient for modern terminals
+- Line numbers included in output
 - Pager support (uses your configured git pager or `less`)
 - Pass-through support for git blame options like `-L`
+- Light/dark terminal background detection
 
 ## Requirements
 
-- Python 3.10+
+- Python 3.9+
 - Git
 - Terminal with 24-bit (true color) support
 
 ## Installation
 
 ```bash
-git clone <repo-url> git-colorblame
+git clone https://github.com/quai/git-colorblame.git
 cd git-colorblame
 ./install.sh
 ```
 
-This adds `git colorblame` as a global git alias.
+This copies `git-colorblame` to `~/.local/bin`. Git automatically discovers it as `git colorblame`.
+
+### Installation Options
+
+```bash
+./install.sh              # Install to ~/.local/bin (recommended)
+./install.sh --alias      # Install as git alias (uses current directory)
+./install.sh --uninstall  # Remove git-colorblame
+./install.sh --help       # Show help
+```
+
+**Note:** If `~/.local/bin` is not in your PATH, add this to your shell profile:
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
 
 ## Usage
 
@@ -100,7 +116,13 @@ The pager is determined in this order:
 ## Uninstall
 
 ```bash
-git config --global --unset alias.colorblame
+./install.sh --uninstall
+```
+
+Or manually:
+```bash
+rm ~/.local/bin/git-colorblame
+git config --global --unset alias.colorblame  # if installed with --alias
 ```
 
 ## License
