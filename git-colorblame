@@ -1,0 +1,321 @@
+#!/usr/bin/env python3
+"""
+git-colorblame: Display git blame with age-based heatmap coloring.
+
+Older commits appear in cold colors (purple/blue), newer commits in hot colors (orange/coral).
+Requires a terminal with 24-bit (true color) support.
+
+Usage:
+    git colorblame <file>
+    git colorblame -L 10,50 <file>
+    git colorblame --no-pager <file>
+    git colorblame --light <file>
+    git-colorblame <file>
+
+Options:
+    --no-pager  Disable pager
+    --no-color  Disable colors
+    --light     Use colors suited for light terminal background
+    --dark      Use colors suited for dark terminal background
+
+Configuration (git config):
+    colorblame.background   Set to 'light' or 'dark'
+    colorblame.pager        Set to 'false' to disable pager
+
+Environment:
+    COLORBLAME_BACKGROUND   Set to 'light' or 'dark' (overrides git config)
+"""
+
+import os
+import shutil
+import subprocess
+import sys
+from datetime import datetime
+
+
+def parse_porcelain_blame(output: str) -> list[dict]:
+    """Parse git blame --porcelain output into structured data."""
+    lines = output.split('\n')
+    result = []
+    commits = {}
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if not line:
+            i += 1
+            continue
+
+        # Each blame entry starts with: <hash> <orig-line> <final-line> [<num-lines>]
+        parts = line.split()
+        if len(parts) >= 3 and len(parts[0]) == 40:
+            commit_hash = parts[0]
+
+            # Read header lines until we hit the content line (starts with tab)
+            i += 1
+            while i < len(lines) and not lines[i].startswith('\t'):
+                header_line = lines[i]
+                if header_line.startswith('author '):
+                    commits.setdefault(commit_hash, {})['author'] = header_line[7:]
+                elif header_line.startswith('author-time '):
+                    commits.setdefault(commit_hash, {})['timestamp'] = int(header_line[12:])
+                elif header_line.startswith('summary '):
+                    commits.setdefault(commit_hash, {})['summary'] = header_line[8:]
+                i += 1
+
+            # Content line (starts with tab)
+            content = ''
+            if i < len(lines) and lines[i].startswith('\t'):
+                content = lines[i][1:]  # Remove leading tab
+                i += 1
+
+            result.append({
+                'hash': commit_hash,
+                'content': content,
+                **commits.get(commit_hash, {})
+            })
+        else:
+            i += 1
+
+    return result
+
+
+def get_color(normalized_age: float) -> tuple[int, int, int]:
+    """
+    Map normalized age (0.0=oldest, 1.0=newest) to RGB color.
+    Uses a plasma-inspired gradient: purple -> blue -> teal -> green -> yellow -> orange
+    """
+    t = max(0.0, min(1.0, normalized_age))
+
+    # Plasma-inspired color stops for a rich, modern look
+    stops = [
+        (0.0,  (94, 60, 153)),    # Deep purple
+        (0.2,  (78, 100, 176)),   # Blue-purple
+        (0.4,  (50, 140, 160)),   # Teal
+        (0.6,  (80, 185, 100)),   # Green
+        (0.8,  (200, 200, 60)),   # Yellow-green
+        (1.0,  (252, 140, 90)),   # Coral/orange
+    ]
+
+    # Find the two stops to interpolate between
+    for i in range(len(stops) - 1):
+        t0, c0 = stops[i]
+        t1, c1 = stops[i + 1]
+        if t0 <= t <= t1:
+            p = (t - t0) / (t1 - t0)
+            r = int(c0[0] + (c1[0] - c0[0]) * p)
+            g = int(c0[1] + (c1[1] - c0[1]) * p)
+            b = int(c0[2] + (c1[2] - c0[2]) * p)
+            return (r, g, b)
+
+    return stops[-1][1]
+
+
+def format_colored(text: str, r: int, g: int, b: int) -> str:
+    """Apply 24-bit ANSI color to text."""
+    return f'\033[38;2;{r};{g};{b}m{text}\033[0m'
+
+
+def format_timestamp(timestamp: int) -> str:
+    """Format Unix timestamp to readable date."""
+    dt = datetime.fromtimestamp(timestamp)
+    return dt.strftime('%Y-%m-%d')
+
+
+def git_config_get(key: str) -> str | None:
+    """Get a value from git config."""
+    try:
+        result = subprocess.run(
+            ['git', 'config', '--get', key],
+            capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def detect_background() -> str:
+    """
+    Detect if terminal has light or dark background.
+    Returns 'light' or 'dark'.
+    """
+    # Check environment variable first
+    bg = os.environ.get('COLORBLAME_BACKGROUND', '').lower()
+    if bg in ('light', 'dark'):
+        return bg
+
+    # Check git config
+    bg = git_config_get('colorblame.background')
+    if bg and bg.lower() in ('light', 'dark'):
+        return bg.lower()
+
+    # Check COLORFGBG (format: "fg;bg" - bg > 6 usually means light)
+    colorfgbg = os.environ.get('COLORFGBG', '')
+    if ';' in colorfgbg:
+        try:
+            bg_value = int(colorfgbg.split(';')[-1])
+            # Values 0-6 are dark colors, 7+ are light
+            if bg_value > 6:
+                return 'light'
+        except ValueError:
+            pass
+
+    # Default to dark (most common for developers)
+    return 'dark'
+
+
+def get_config_bool(key: str, default: bool) -> bool:
+    """Get a boolean value from git config."""
+    value = git_config_get(key)
+    if value is None:
+        return default
+    return value.lower() in ('true', 'yes', '1', 'on')
+
+
+def get_pager() -> list[str] | None:
+    """Get the pager command from git config or environment."""
+    # Check GIT_PAGER environment variable
+    pager = os.environ.get('GIT_PAGER')
+    if pager:
+        return pager.split()
+
+    # Check git config
+    try:
+        result = subprocess.run(
+            ['git', 'config', '--get', 'core.pager'],
+            capture_output=True, text=True
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip().split()
+    except Exception:
+        pass
+
+    # Check PAGER environment variable
+    pager = os.environ.get('PAGER')
+    if pager:
+        return pager.split()
+
+    # Default to less with color support if available
+    if shutil.which('less'):
+        return ['less', '-R']
+
+    return None
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__.strip(), file=sys.stderr)
+        sys.exit(1)
+
+    # Pass all arguments to git blame
+    args = sys.argv[1:]
+
+    # Check if output is a terminal (for color support)
+    is_tty = sys.stdout.isatty()
+    use_color = is_tty
+    use_pager = is_tty and get_config_bool('colorblame.pager', True)
+
+    # Check for --no-color flag
+    if '--no-color' in args:
+        use_color = False
+        args.remove('--no-color')
+
+    # Check for --no-pager / --pager flags
+    if '--no-pager' in args:
+        use_pager = False
+        args.remove('--no-pager')
+    elif '--pager' in args:
+        use_pager = is_tty
+        args.remove('--pager')
+
+    # Check for --light/--dark flags
+    if '--light' in args:
+        background = 'light'
+        args.remove('--light')
+    elif '--dark' in args:
+        background = 'dark'
+        args.remove('--dark')
+    else:
+        background = detect_background()
+
+    # Run git blame with porcelain format
+    cmd = ['git', 'blame', '--porcelain'] + args
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"Error running git blame: {e.stderr}", file=sys.stderr)
+        sys.exit(e.returncode)
+    except FileNotFoundError:
+        print("Error: git not found in PATH", file=sys.stderr)
+        sys.exit(1)
+
+    # Parse the output
+    blame_entries = parse_porcelain_blame(result.stdout)
+
+    if not blame_entries:
+        print("No blame data found", file=sys.stderr)
+        sys.exit(1)
+
+    # Find timestamp range for normalization
+    timestamps = [e.get('timestamp', 0) for e in blame_entries if e.get('timestamp')]
+    if not timestamps:
+        print("No timestamps found in blame data", file=sys.stderr)
+        sys.exit(1)
+
+    min_ts = min(timestamps)
+    max_ts = max(timestamps)
+    ts_range = max_ts - min_ts if max_ts != min_ts else 1
+
+    # Calculate max widths for alignment
+    max_author_len = max(len(e.get('author', '')[:20]) for e in blame_entries)
+
+    # Build output lines
+    output_lines = []
+    for entry in blame_entries:
+        short_hash = entry['hash'][:8]
+        author = entry.get('author', 'Unknown')[:20].ljust(max_author_len)
+        timestamp = entry.get('timestamp', min_ts)
+        date_str = format_timestamp(timestamp)
+        content = entry.get('content', '')
+
+        # Check for uncommitted changes (hash is all zeros)
+        is_uncommitted = entry['hash'] == '0' * 40
+
+        if use_color:
+            if is_uncommitted:
+                # Uncommitted: white on dark bg, dark gray on light bg
+                if background == 'light':
+                    r, g, b = (80, 80, 80)
+                else:
+                    r, g, b = (255, 255, 255)
+            else:
+                # Normalize age (0=oldest, 1=newest)
+                normalized_age = (timestamp - min_ts) / ts_range
+                r, g, b = get_color(normalized_age)
+            metadata = format_colored(f'{short_hash} ({author} {date_str})', r, g, b)
+        else:
+            metadata = f'{short_hash} ({author} {date_str})'
+
+        output_lines.append(f'{metadata} {content}')
+
+    output = '\n'.join(output_lines)
+
+    # Output with or without pager
+    if use_pager:
+        pager_cmd = get_pager()
+        if pager_cmd:
+            try:
+                pager = subprocess.Popen(pager_cmd, stdin=subprocess.PIPE, text=True)
+                pager.communicate(input=output)
+                sys.exit(pager.returncode or 0)
+            except Exception:
+                pass  # Fall through to print
+
+    print(output)
+
+
+if __name__ == '__main__':
+    main()
